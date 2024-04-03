@@ -1,12 +1,13 @@
 import torch
 from torch import nn
 import math
-import warnings
-from intel_extension_for_pytorch.nn.modules import IpexWoqLinear
+from .....utils._logger import logger, WarningType
+from intel_extension_for_pytorch.nn.modules import WeightOnlyQuantizedLinear
 from intel_extension_for_pytorch.quantization import (
     get_weight_only_quant_qconfig_mapping,
     dequantize_per_channel,
     dequantize_per_block,
+    WoqWeightDtype,
 )
 
 
@@ -243,7 +244,10 @@ class _IPEXConcatLinearCPU(_IPEXlinearFusionCPU):
         if (
             woq
             and (not use_g_idx)
-            and all(isinstance(linear, IpexWoqLinear) for linear in self.linear_list)
+            and all(
+                isinstance(linear, WeightOnlyQuantizedLinear)
+                for linear in self.linear_list
+            )
         ):
             # Quantization is done before lowering to CPU.
             # We assume weights are all in shape [N, K].
@@ -266,49 +270,56 @@ class _IPEXConcatLinearCPU(_IPEXlinearFusionCPU):
             for i in range(self.num_concat):
                 linear = self.linear_list[i]
                 if not hasattr(linear, "_op_context"):
-                    warnings.warn(
+                    logger.warning(
                         "Concat linear fusion for CPU WOQ failed "
-                        "because linear is not converted to WOQ Linear. "
-                        "Falling back to separate linears."
+                        + "because linear is not converted to WOQ Linear. "
+                        + "Falling back to separate linears.",
+                        _type=WarningType.NotSupported,
                     )
                     weights_list = []
                     break
                 qw = linear._op_context.to_public(linear._op_context.get_weight())
                 scales = linear._op_context.get_scales()
                 zero_points = linear._op_context.get_zero_points()
-                is_int4 = w_dtype == torch.quint4x2
                 weight_shape = linear._op_context.get_weight_shape()
                 if group_size > 0:
                     weights_list.append(
                         dequantize_per_block(
-                            qw, scales, zero_points, is_int4, group_size, weight_shape
+                            qw, scales, zero_points, w_dtype, group_size, weight_shape
                         )
                     )
                 else:
                     weights_list.append(
                         dequantize_per_channel(
-                            qw, scales, zero_points, is_int4, weight_shape
+                            qw, scales, zero_points, w_dtype, weight_shape
                         )
                     )
                 # OC of Weight may be padded to a multiple of block_n. So are scales and zero points.
                 bias = linear._op_context.get_bias()
-                assert scales.shape == zero_points.shape
+                assert zero_points is None or scales.shape == zero_points.shape
                 assert bias is None or bias.shape[0] == scales.shape[0]
                 if weight_shape[0] < scales.shape[0]:
                     original_n = weight_shape[0]
                     scales_list.append(scales.narrow(0, 0, original_n).contiguous())
-                    zeros_list.append(zero_points.narrow(0, 0, original_n).contiguous())
+                    if zero_points is not None:
+                        zeros_list.append(
+                            zero_points.narrow(0, 0, original_n).contiguous()
+                        )
                     bias_list.append(bias.narrow(0, 0, original_n).contiguous())
                 else:
                     assert weight_shape[0] == scales.shape[0]
                     scales_list.append(scales)
-                    zeros_list.append(zero_points)
+                    if zero_points is not None:
+                        zeros_list.append(zero_points)
                     bias_list.append(bias)
                 w_dtype = linear.dtype
             if weights_list:
                 concat_weight = torch.concat(weights_list, 0)
                 concat_scales = torch.concat(scales_list, 0)
-                concat_zeros = torch.concat(zeros_list, 0)
+                if len(zeros_list) > 0:
+                    concat_zeros = torch.concat(zeros_list, 0)
+                else:
+                    concat_zeros = None
                 use_bias = all([b is not None for b in bias_list])
                 concat_bias = torch.concat(bias_list, 0) if use_bias else None
                 mod = nn.Linear(
@@ -317,17 +328,19 @@ class _IPEXConcatLinearCPU(_IPEXlinearFusionCPU):
                 mod.weight = nn.Parameter(concat_weight)
                 mod.bias = nn.Parameter(concat_bias) if use_bias else None
                 mod.qconfig = qconfig
-                if w_dtype == torch.quint4x2:
-                    self.concat_linear = IpexWoqLinear.from_float_and_int4_weight(
-                        mod,
-                        concat_weight,
-                        concat_scales,
-                        concat_zeros,
-                        group_size=group_size,
+                if w_dtype == WoqWeightDtype.INT4:
+                    self.concat_linear = (
+                        WeightOnlyQuantizedLinear.from_float_and_int4_weight(
+                            mod,
+                            concat_weight,
+                            concat_scales,
+                            concat_zeros,
+                            group_size=group_size,
+                        )
                     )
-                else:  # qint8
-                    assert w_dtype == torch.qint8
-                    self.concat_linear = IpexWoqLinear.from_float(
+                else:  # int8 or nf4
+                    assert w_dtype in (WoqWeightDtype.INT8, WoqWeightDtype.NF4)
+                    self.concat_linear = WeightOnlyQuantizedLinear.from_float(
                         mod, concat_scales, concat_zeros
                     )
         elif (
@@ -383,3 +396,27 @@ class _IPEXlinearSiluMulCPU(nn.Module):
             )
         else:  # fallback path
             return nn.functional.silu(self.linear_s(x)) * self.linear_m(x)
+
+
+class _IPEXlinearSiluAndMulCPU(nn.Module):
+    def __init__(self, module, tpp=False, woq=False):
+        super().__init__()
+        self.tpp = tpp
+        self.woq = woq
+        self.linear = module
+        self.dtype = module.weight.dtype if self.tpp else None
+
+    def forward(self, x, y):
+        if self.tpp and not self.linear.tpp_fallback:
+            x = x.to(self.dtype).contiguous()
+            x1 = torch.ops.torch_ipex.tpp_linear_silu(
+                x,
+                self.linear.weight.detach(),
+                self.linear.bias.detach()
+                if self.linear.bias is not None
+                else x.new_empty(0),
+                self.linear.out_features,
+            )
+            return x1 * y
+        else:  # fallback path
+            return nn.functional.silu(self.linear(x)) * y

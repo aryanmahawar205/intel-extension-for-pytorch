@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 import torch.distributed as dist
-import warnings
+from ...utils._logger import logger, WarningType
 from typing import Optional, Tuple, Union, List
 from transformers.generation.stopping_criteria import (
     StoppingCriteriaList,
@@ -65,16 +65,16 @@ def _beam_search(
         stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
     )
     if max_length is not None:
-        warnings.warn(
+        logger.warning(
             "`max_length` is deprecated in this function, use"
             " `stopping_criteria=StoppingCriteriaList(MaxLengthCriteria(max_length=max_length))` instead.",
-            UserWarning,
+            _type=WarningType.DeprecatedArgument,
         )
         stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
     if len(stopping_criteria) == 0:
-        warnings.warn(
-            "You don't have defined any stopping_criteria, this will likely loop forever",
-            UserWarning,
+        logger.warning(
+            "You have not defined any stopping_criteria, this will likely loop forever",
+            _type=WarningType.WrongArgument,
         )
     pad_token_id = (
         pad_token_id
@@ -189,9 +189,10 @@ def _beam_search(
             "StableLmForCausalLM",
             "QWenLMHeadModel",
             "GitForCausalLM",
+            "LlavaLlamaForCausalLM",
         ]:
             first_token = False
-            has_position_id = "position_ids" in model_inputs
+            has_position_id = model_inputs.get("position_ids", None) is not None
             if model_inputs["past_key_values"] is None:
                 first_token = True
                 if self.model_backbone == "T5ForConditionalGeneration":
@@ -324,6 +325,10 @@ def _beam_search(
                 model_inputs["encoder_outputs"] = (
                     model_inputs["encoder_outputs"]["last_hidden_state"],
                 )
+            if self.model_backbone == "LlavaLlamaForCausalLM" and hasattr(
+                self, "prepare_inputs_labels_for_multimodal"
+            ):
+                model_inputs = self.prepare_inputs_labels_for_multimodal(**model_inputs)
             if hasattr(self, "trace_graph"):
                 if first_token and hasattr(self, "trace_graph_first"):
                     outputs = self.trace_graph_first(**model_inputs)

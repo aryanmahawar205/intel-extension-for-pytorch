@@ -12,6 +12,10 @@ from common_utils import TestCase
 import intel_extension_for_pytorch as ipex
 
 from torch.testing._internal.common_utils import run_tests
+from intel_extension_for_pytorch.quantization import (
+    WoqWeightDtype,
+    WoqLowpMode,
+)
 
 
 class GPTQLLMTester(TestCase):
@@ -77,8 +81,8 @@ class GPTQLLMTester(TestCase):
                     work_dir + "/gptq_checkpoint_g128.pt"
                 )
                 qconfig = ipex.quantization.get_weight_only_quant_qconfig_mapping(
-                    weight_dtype=torch.quint4x2,
-                    lowp_mode=ipex.quantization.WoqLowpMode.INT8,
+                    weight_dtype=WoqWeightDtype.INT4,
+                    lowp_mode=WoqLowpMode.INT8,
                 )
                 model = copy.deepcopy(gptj)
                 model.eval()
@@ -96,7 +100,7 @@ class GPTQLLMTester(TestCase):
                 _IPEXDecoderLayerCPU = (
                     ipex.transformers.models.cpu.modules.decoder._IPEXDecoderLayerCPU
                 )
-                IpexWoqLinear = ipex.nn.modules.IpexWoqLinear
+                WeightOnlyQuantizedLinear = ipex.nn.modules.WeightOnlyQuantizedLinear
                 assert model.transformer.h[0].attn.__class__ is _IPEXAttentionCPU
                 assert model.transformer.h[0].__class__ is _IPEXDecoderLayerCPU
                 layers_to_check = [
@@ -109,7 +113,10 @@ class GPTQLLMTester(TestCase):
                     layers_to_check.append(
                         model.transformer.h[0].attn.concat_qkv.concat_linear
                     )
-                assert all(mod.__class__ is IpexWoqLinear for mod in layers_to_check)
+                assert all(
+                    mod.__class__ is WeightOnlyQuantizedLinear
+                    for mod in layers_to_check
+                )
 
                 # Ensure model can run without errors
                 with torch.no_grad():

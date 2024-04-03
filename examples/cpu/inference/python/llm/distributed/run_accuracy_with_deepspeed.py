@@ -224,7 +224,7 @@ class HuggingFaceModel(BaseLM):
 
         # For now, Falcon, baichuan and gptbigcode have accuracy issue with from_config with deepspeed meta device load.
         # TODO: we will change the scope once deepspeed providing the support
-        if world_size == 1 or model_type in ["falcon", "baichuan", "gptbigcode"]:
+        if world_size == 1 or model_type in ["falcon", "baichuan", "gptbigcode", "qwen"]:
             self.model = model_class[0].from_pretrained(
                 model_id,
                 config=self.config,
@@ -328,8 +328,9 @@ class HuggingFaceModel(BaseLM):
         if self._with_ipex:
             ipex_woq_enabled = args.ipex_weight_only_quantization
             if ipex_woq_enabled:
+                from intel_extension_for_pytorch.quantization import WoqWeightDtype
                 weight_dtype = (
-                    torch.quint4x2 if args.weight_dtype == "INT4" else torch.qint8
+                    WoqWeightDtype.INT4 if args.weight_dtype == "INT4" else WoqWeightDtype.INT8
                 )
 
                 if args.lowp_mode == "INT8":
@@ -341,7 +342,7 @@ class HuggingFaceModel(BaseLM):
                 elif args.lowp_mode == "BF16":
                     lowp_mode = ipex.quantization.WoqLowpMode.BF16
                 else:  # AUTO
-                    if weight_dtype == torch.quint4x2:
+                    if weight_dtype == WoqWeightDtype.INT4:
                         lowp_mode = ipex.quantization.WoqLowpMode.INT8
                     else:
                         lowp_mode = ipex.quantization.WoqLowpMode.BF16
@@ -479,8 +480,8 @@ class HuggingFaceModel(BaseLM):
         else:
             past_key_values = self._get_past_key_values(input_bs)
             example_dict = {"input_ids": inputs}
-        model_inputs = self.base_model.prepare_inputs_for_generation(inputs)
-        has_position_ids = "position_ids" in model_inputs
+        model_inputs = self.base_model.prepare_inputs_for_generation(inputs, attention_mask=attention_mask_batched)
+        has_position_ids = model_inputs.get("position_ids", None) is not None
         if self._with_jit:
             example_dict["attention_mask"]= attention_mask_batched
             example_dict["past_key_values"]= past_key_values

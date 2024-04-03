@@ -1,6 +1,6 @@
 # 1. LLM Optimization Overview
 
-ipex.llm provides dedicated optimization for running Large Language Models (LLM) faster, including technical points like paged attention, ROPE fusion, etc. And a set of data types are supported for various scenarios, including FP32, BF16, Smooth Quantization INT8, Weight Only Quantization INT8/INT4 (experimental).
+ipex.llm provides dedicated optimization for running Large Language Models (LLM) faster, including technical points like paged attention, ROPE fusion, etc. And a set of data types are supported for various scenarios, including FP32, BF16, Smooth Quantization INT8, Weight Only Quantization INT8/INT4 (prototype).
 
 <br>
 
@@ -30,6 +30,9 @@ ipex.llm provides dedicated optimization for running Large Language Models (LLM)
 |T5| google/flan-t5-xl | 🟩 | 🟩 | 🟨 |  🟩 |    |
 |Mistral| mistralai/Mistral-7B-v0.1 | 🟩 | 🟩 | 🟨 |  🟩 | 🟨 |
 |MPT| mosaicml/mpt-7b | 🟩 | 🟩 | 🟨 |  🟩 | 🟩 |
+|Mixtral| mistralai/Mixtral-8x7B-v0.1 | 🟩 | 🟩 |  |  🟩 |  |
+|Stablelm| stabilityai/stablelm-2-1_6b | 🟩 | 🟩 |  |  🟨 |  |
+|Qwen| Qwen/Qwen-7B-Chat | 🟩 | 🟩 |  |  🟩 |  |
 
 ## 2.2 Verified for distributed inference mode via DeepSpeed
 
@@ -166,7 +169,8 @@ OMP_NUM_THREADS=56 numactl -m 0 -C 0-55 python run.py --benchmark -m meta-llama/
 #### 4.1.1.4 Run in static quantization INT8 with ipex.llm
 
 ```bash
-OMP_NUM_THREADS=56 numactl -m 0 -C 0-55 python run.py  --benchmark -m meta-llama/Llama-2-7b-hf --ipex-smooth-quant --qconfig-summary-file <path to "llama-2-7b_qconfig.json"> --output-dir "saved_results"
+wget https://intel-extension-for-pytorch.s3.amazonaws.com/miscellaneous/llm/cpu/2/llama2-7b_qconfig.json
+OMP_NUM_THREADS=56 numactl -m 0 -C 0-55 python run.py  --benchmark -m meta-llama/Llama-2-7b-hf --ipex-smooth-quant --qconfig-summary-file llama2-7b_qconfig.json --output-dir "saved_results"
 ```
 
 #### 4.1.1.5 Run in weight-only quantization INT8 with ipex.llm
@@ -216,7 +220,7 @@ OMP_NUM_THREADS=56 numactl -m 0 -C 0-55 python run_accuracy.py  -m meta-llama/Ll
 OMP_NUM_THREADS=56 numactl -m 0 -C 0-55 python run_accuracy.py  -m meta-llama/Llama-2-7b-hf --dtype bfloat16 --ipex --tasks lambada_openai
 
 # Quantization
-OMP_NUM_THREADS=56 numactl -m 0 -C 0-55 python run_accuracy.py -m meta-llama/Llama-2-7b-hf --quantized-model-path "./saved_results/best_model.pt" --dtype int8  --tasks lambada_openai
+OMP_NUM_THREADS=56 numactl -m 0 -C 0-55 python run_accuracy.py -m meta-llama/Llama-2-7b-hf --quantized-model-path "../saved_results/best_model.pt" --dtype int8  --tasks lambada_openai
 ```
 
 #### 4.1.2.2 Distributed inference
@@ -418,6 +422,8 @@ There are some model-specific requirements to be aware of, as follows:
 
 - For Falcon models from remote hub, we need to modify the config.json to use the modeling_falcon.py in transformers. Therefore, in the following scripts, we need to pass an extra configuration file like "--config-file=model_config/tiiuae_falcon-40b_config.json". This is optional for FP32/BF16 but needed for quantizations.
 
+- For Llava models from remote hub, additional setup is required, i.e., `bash ./tools/prepare_llava.sh`.
+
 ## 4.3 Instructions for Running LLM with Intel® Xeon® CPU Max Series
 
 Intel® Xeon® CPU Max Series are equipped with high bandwidth memory (HBM), which further accelerates LLM inference. For the common case that HBM and DDR are both installed in a Xeon® CPU Max Series server, the memory mode can be configured to Flat Mode or Cache Mode. Details about memory modes can be found at Section 3.1 in [the Xeon® CPU Max Series Configuration Guide](https://cdrdv2-public.intel.com/769060/354227-intel-xeon-cpu-max-series-configuration-and-tuning-guide.pdf).
@@ -461,17 +467,23 @@ Then we can invoke distributed inference with `deepspeed` command:
 
 - Command:
 ```bash
-deepspeed --bind_cores_to_rank  run.py --benchmark -m <SHARDED_MODEL_PATH> --dtype bfloat16 --ipex --autotp
+deepspeed --bind_cores_to_rank run.py --benchmark -m <SHARDED_MODEL_PATH> --dtype bfloat16 --ipex --autotp
 ```
 
 As the model has been sharded, we specify `SHARDED_MODEL_PATH` for `-m` argument instead of original model name or path, and `--shard-model` argument is not needed.
+
+- An example of llama2 7b model:
+```bash
+python utils/create_shard_model.py -m meta-llama/Llama-2-7b-hf --save-path ./local_llama2_7b
+deepspeed --bind_cores_to_rank run.py --benchmark -m ./local_llama2_7b --dtype bfloat16 --ipex --autotp
+```
 
 <br>
 
 
 # 5. Advanced Usage
 
-## 5.1 Weight-only quantization with low precision checkpoint (Experimental)
+## 5.1 Weight-only quantization with low precision checkpoint (Prototype)
 
 Using INT4 weights can further improve performance by reducing memory bandwidth. However, direct per-channel quantization of weights to INT4 probably results in poor accuracy. Some algorithms can modify weights through calibration before quantizing weights to minimize accuracy drop. GPTQ is one of such algorithms. You may generate modified weights and quantization info (scales, zero points) for a certain model with a dataset by such algorithms. The low precision checkpoint is saved as a `state_dict` in a `.pt` file and can be loaded later for weight only quantization. We provide an example here to run GPTQ.
 
@@ -591,13 +603,13 @@ For the quantized models to be used in accuracy tests, we can reuse the model fi
 
 - Command:
 ```bash
-OMP_NUM_THREADS=<physical cores num> numactl -m <node N> -C <cpu list> python run_accuracy.py --model <MODEL ID> --quantized-model-path "./saved_results/best_model.pt" --dtype <int8 or int4> --tasks {TASK_NAME}
+OMP_NUM_THREADS=<physical cores num> numactl -m <node N> -C <cpu list> python run_accuracy.py --model <MODEL ID> --quantized-model-path "../saved_results/best_model.pt" --dtype <int8 or int4> --tasks {TASK_NAME}
 # Please add  "--quant-with-amp" if your model is quantized with this flag
 ```
 
 - An example of llama2 7b model:
 ```bash
-OMP_NUM_THREADS=56 numactl -m 0 -C 0-55 python run_accuracy.py -m meta-llama/Llama-2-7b-hf --quantized-model-path "./saved_results/best_model.pt" --dtype int8  --tasks lambada_openai
+OMP_NUM_THREADS=56 numactl -m 0 -C 0-55 python run_accuracy.py -m meta-llama/Llama-2-7b-hf --quantized-model-path "../saved_results/best_model.pt" --dtype int8  --tasks lambada_openai
 ```
 
 ### 5.2.2 Run in distributed way
@@ -667,7 +679,7 @@ python create_shard_model.py -m <MODEL ID>  --save-path <SHARD MODEL NEW PATH>
 # After sharding the model, using -m <SHARD MODEL NEW PATH> in later tests
 
 # An example of llama2 7b:
-python create_shard_model.py meta-llama/Llama-2-7b-hf --save-path ./local_llama2_7b
+python create_shard_model.py -m meta-llama/Llama-2-7b-hf --save-path ./local_llama2_7b
 ```
 
 <br>

@@ -31,7 +31,6 @@ class _IPEXDecoderLayerCPU(nn.Module):
             "LlamaForCausalLM",
             "BaichuanForCausalLM",
             "MistralForCausalLM",
-            "StableLmForCausalLM",
             "QWenLMHeadModel",
         ]:
             if not self.distributed:
@@ -41,6 +40,26 @@ class _IPEXDecoderLayerCPU(nn.Module):
                 self.mlp_linear_add = _IPEXlinearAddCPU(
                     module.mlp_linear_add.linear, tpp=tpp, woq=woq
                 )
+            self.linear_silu_mul = _IPEXlinearSiluMulCPU(
+                module.linear_silu_mul.linear_s,
+                module.linear_silu_mul.linear_m,
+                tpp=tpp,
+                woq=woq,
+            )
+        elif self.model_backbone == "StableLmForCausalLM":
+            if not self.distributed:
+                if hasattr(module, "mha_linear_add"):
+                    self.mha_linear_add = _IPEXlinearAddCPU(
+                        module.mha_linear_add.linear, tpp=tpp, woq=woq
+                    )
+                if hasattr(module, "mlp_linear_add"):
+                    self.mlp_linear_add = _IPEXlinearAddCPU(
+                        module.mlp_linear_add.linear, tpp=tpp, woq=woq
+                    )
+                if hasattr(module, "mlp_linear_add_add"):
+                    self.mlp_linear_add = _IPEXlinearAddAddCPU(
+                        module.mlp_linear_add_add.linear, tpp=tpp, woq=woq
+                    )
             self.linear_silu_mul = _IPEXlinearSiluMulCPU(
                 module.linear_silu_mul.linear_s,
                 module.linear_silu_mul.linear_m,
@@ -160,6 +179,31 @@ class _IPEXDecoderLayerCPU(nn.Module):
             if hasattr(module, "vision_linear_gelu"):
                 self.vision_linear_gelu = _IPEXlinearGeluCPU(
                     module.vision_linear_gelu.linear, tpp=tpp, woq=woq
+                )
+        elif self.model_backbone == "LlavaLlamaForCausalLM":
+            if not self.distributed:
+                if hasattr(module, "mha_linear_add"):
+                    self.mha_linear_add = _IPEXlinearAddCPU(
+                        module.mha_linear_add.linear, tpp=tpp, woq=woq
+                    )
+                if hasattr(module, "mlp_linear_add"):
+                    self.mlp_linear_add = _IPEXlinearAddCPU(
+                        module.mlp_linear_add.linear, tpp=tpp, woq=woq
+                    )
+                if hasattr(module, "vision_mha_linear_add"):
+                    self.vision_mha_linear_add = _IPEXlinearAddCPU(
+                        module.vision_mha_linear_add.linear, tpp=tpp, woq=woq
+                    )
+                if hasattr(module, "vision_mlp_linear_add"):
+                    self.vision_mlp_linear_add = _IPEXlinearAddCPU(
+                        module.vision_mlp_linear_add.linear, tpp=tpp, woq=woq
+                    )
+            if hasattr(module, "linear_silu_mul"):
+                self.linear_silu_mul = _IPEXlinearSiluMulCPU(
+                    module.linear_silu_mul.linear_s,
+                    module.linear_silu_mul.linear_m,
+                    tpp=tpp,
+                    woq=woq,
                 )
         else:
             AssertionError(False, "Do not support the optimization of your model yet")

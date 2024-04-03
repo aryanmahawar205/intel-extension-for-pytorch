@@ -153,6 +153,7 @@ class _IPEXRopeRef(nn.Module):
             "LlamaForCausalLM",
             "MistralForCausalLM",
             "MixtralForCausalLM",
+            "LlavaLlamaForCausalLM",
         ]:
             x = x.transpose(1, 2)
             x = self.apply_rotary_pos_emb_llama(x, _cos, _sin, position_ids)
@@ -292,12 +293,17 @@ class _IPEXScaleDotProductRef(nn.Module):
             "MistralForCausalLM",
             "MixtralForCausalLM",
             "StableLmForCausalLM",
+            "LlavaLlamaForCausalLM",
         ]:
             self.num_key_value_groups = (
                 module.num_key_value_groups
                 if hasattr(module, "num_key_value_groups")
                 else None
             )
+            if hasattr(module, "num_heads"):
+                self.num_heads = module.num_heads
+            if hasattr(module, "head_dim"):
+                self.head_dim = module.head_dim
         elif self.model_backbone == "OPTForCausalLM":
             self.num_heads = module.num_heads
             self.head_dim = module.head_dim
@@ -479,6 +485,12 @@ class _IPEXScaleDotProductRef(nn.Module):
                 key[:, :, cutoff:, :],
                 value[:, :, cutoff:, :],
             )
+        elif (
+            self.model_backbone == "LlavaLlamaForCausalLM"
+            and vision is not None
+            and vision
+        ):
+            present = None
         else:
             if layer_past is not None:
                 past_key = layer_past[0]
@@ -794,6 +806,133 @@ class _IPEXScaleDotProductRef(nn.Module):
             if head_mask is not None:
                 attn_weights = attn_weights * head_mask
             attn_output = torch.matmul(attn_weights, value)
+        elif self.model_backbone == "LlavaLlamaForCausalLM":
+            if vision is not None and vision:
+                bsz = query.shape[0]
+                proj_shape = (bsz * self.num_heads, -1, self.head_dim)
+                query_states = query.transpose(1, 2).contiguous().view(*proj_shape)
+                key_states = key.transpose(1, 2).contiguous().view(*proj_shape)
+                value_states = value.view(*proj_shape)
+
+                src_len = key_states.size(1)
+                attn_weights = (
+                    torch.bmm(query_states, key_states.transpose(1, 2)) / scale_attn
+                )
+
+                if attention_mask is not None:
+                    attn_weights = (
+                        attn_weights.view(bsz, self.num_heads, -1, src_len)
+                        + attention_mask
+                    )
+                    attn_weights = attn_weights.view(bsz * self.num_heads, -1, src_len)
+
+                attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+                attn_output = torch.bmm(attn_weights, value_states)
+                attn_weights = attn_weights.view(bsz, self.num_heads, -1, src_len)
+            else:
+                # repeat k/v heads if n_kv_heads < n_heads
+                key = self._repeat_kv(key, self.num_key_value_groups)
+                value = self._repeat_kv(value, self.num_key_value_groups)
+
+                attn_weights = torch.matmul(query, key.transpose(2, 3)) / scale_attn
+
+                if attention_mask is not None:
+                    attn_weights = attn_weights + attention_mask
+
+                # upcast attention to fp32
+                attn_weights = nn.functional.softmax(
+                    attn_weights, dim=-1, dtype=torch.float32
+                ).to(query.dtype)
+                attn_output = torch.matmul(attn_weights, value)
         else:
             AssertionError(False, "Do not support the optimization of your model yet")
         return attn_output, attn_weights, present
+
+
+class _IPEXRMSNormRef(nn.Module):
+    def __init__(self, module):
+        super().__init__()
+        self.weight = module.weight
+        self.variance_epsilon = module.variance_epsilon
+
+    def forward(self, hidden_states):
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+
+        # convert into half-precision if necessary
+        if self.weight.dtype in [torch.float16, torch.bfloat16]:
+            hidden_states = hidden_states.to(self.weight.dtype)
+
+        return self.weight * hidden_states
+
+
+class _IPEXPagedAttentionRef:
+    @classmethod
+    def reshape_and_cache(cls, key, value, key_cache, value_cache, slot_mapping):
+        if key.dtype is torch.bfloat16:
+            x = 16 // torch.tensor([], dtype=key.dtype).element_size()
+        else:
+            x = 32 // torch.tensor([], dtype=key.dtype).element_size()
+
+        num_key_value_heads = key.shape[-2]
+        head_size = key.shape[-1]
+        reshaped_key = key.reshape(-1, num_key_value_heads, head_size // x, x)
+        num_tokens = value.shape[0]
+        block_size = value_cache.shape[3]
+        for i in range(num_tokens):
+            block_idx = torch.div(slot_mapping[i], block_size, rounding_mode="floor")
+            block_offset = slot_mapping[i] % block_size
+            key_cache[block_idx, :, :, block_offset, :] = reshaped_key[i]
+            value_cache[block_idx, :, :, block_offset] = value[i]
+
+    @classmethod
+    def single_query_cached_kv_attention(
+        cls,
+        output,
+        query,
+        key_cache,
+        value_cache,
+        head_mapping,
+        scale,
+        block_tables,
+        context_lens,
+        block_size,
+        max_context_len,
+        alibi_slopes,
+    ) -> None:
+        num_heads = value_cache.shape[1]
+        head_size = value_cache.shape[2]
+        block_size = value_cache.shape[3]
+
+        num_input_tokens = query.shape[0]
+        for i in range(num_input_tokens):
+            q = query[i].unsqueeze(0)
+            block_table = block_tables[i]
+            context_len = int(context_lens[i])
+            keys = []
+            values = []
+            for j in range(context_len):
+                block_number = int(block_table[j // block_size])
+                block_offset = j % block_size
+
+                k = key_cache[block_number, :, :, block_offset, :]
+                k = k.reshape(num_heads, head_size)
+                keys.append(k)
+
+                v = value_cache[block_number, :, :, block_offset]
+                values.append(v)
+            keys = torch.stack(keys, dim=0)
+            values = torch.stack(values, dim=0)
+
+            scale = 1.0 / (head_size**0.5)
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q.view(1, -1, num_heads, head_size).transpose(1, 2),
+                keys.view(1, -1, num_heads, head_size).transpose(1, 2),
+                values.view(1, -1, num_heads, head_size).transpose(1, 2),
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=False,
+            )
+            out = out.view(num_heads, head_size)
+            output[i].copy_(out, non_blocking=True)

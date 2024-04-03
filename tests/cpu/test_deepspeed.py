@@ -204,7 +204,15 @@ class DeepspeedTester(JitTestCase):
             ds_model = self._get_ds_model(m_linear)
             self.assertTrue(module_found(ds_model, LinearLayer))
             self.assertTrue(module_found(ds_model, LinearAllreduce))
-            if check_lm_head:
+
+            # TODO: [Notes: LmHeadLinearAllreduce replacement test]
+            # On the public master of deepspeed,
+            # LmHeadLinearAllreduce replacement will only happen if checkpoint has been loaded:
+            # github.com/microsoft/DeepSpeed/blob/16c265c0ce103147d027d9cae32dd7680766af21/deepspeed/module_inject/replace_module.py
+            # #L352
+            # Need to figure out a way to use checkpoint in the UT to test LmHeadLinearAllreduce replacement.
+            # Disable the check for now.
+            if False:  # if check_lm_head:
                 self.assertTrue(module_found(ds_model, LmHeadLinearAllreduce))
 
             optimized = ipex.optimize(ds_model.eval(), inplace=True)
@@ -218,7 +226,8 @@ class DeepspeedTester(JitTestCase):
                 self.assertTrue(module_found(optimized, _IPEXLinear))
                 self.assertTrue(module_found(optimized, _IPEXLinearAllreduce))
 
-                if check_lm_head:
+                # TODO: Check [Notes: LmHeadLinearAllreduce replacement test]
+                if False:  # if check_lm_head:
                     self.assertTrue(module_found(optimized, _IPEXLmHeadLinearAllreduce))
 
                 jit_optimized(x)
@@ -251,7 +260,8 @@ class DeepspeedTester(JitTestCase):
             ds_model = self._get_ds_model(m_linear)
             self.assertTrue(module_found(ds_model, LinearLayer))
             self.assertTrue(module_found(ds_model, LinearAllreduce))
-            if check_lm_head:
+            # TODO: Check [Notes: LmHeadLinearAllreduce replacement test]
+            if False:  # if check_lm_head:
                 self.assertTrue(module_found(ds_model, LmHeadLinearAllreduce))
 
             prepared_model = prepare(
@@ -265,7 +275,9 @@ class DeepspeedTester(JitTestCase):
             self.assertTrue(
                 all(module_found(converted, qmodule) for qmodule in qmodules)
             )
-            if check_lm_head:
+
+            # TODO: Check [Notes: LmHeadLinearAllreduce replacement test]
+            if False:  # if check_lm_head
                 self.assertTrue(
                     all(
                         module_found(converted, lm_head_qmodule)
@@ -316,7 +328,7 @@ class DeepspeedTester(JitTestCase):
         self._test_quantization(
             ipex.quantization.get_weight_only_quant_qconfig_mapping(),
             [
-                ipex.nn.modules.weight_only_quantization.IpexWoqLinear,
+                ipex.nn.modules.weight_only_quantization.WeightOnlyQuantizedLinear,
                 ipex.nn.modules.weight_only_quantization.IpexWoqLinearAllreduce,
             ],
             [ipex.nn.modules.weight_only_quantization.IpexWoqLmHeadLinearAllreduce],
@@ -353,7 +365,7 @@ class DeepspeedTester(JitTestCase):
                     self.assertEqual(y, jit_res)
                 _disable_tpp()
 
-    def test_llama_with_optimize_transformers(self):
+    def test_llama_with_llm_optimize(self):
         curpath = os.path.abspath(os.path.dirname(__file__))
         config = AutoConfig.from_pretrained(
             f"{curpath}/hf_configs/llama", return_dict=False
@@ -361,7 +373,7 @@ class DeepspeedTester(JitTestCase):
         model = transformers.models.llama.modeling_llama.LlamaForCausalLM(config).eval()
         model = self._get_ds_model(model)
         qconfig = ipex.quantization.get_weight_only_quant_qconfig_mapping()
-        model = ipex.optimize_transformers(
+        model = ipex.llm.optimize(
             model.eval(),
             dtype=torch.bfloat16,
             quantization_config=qconfig,

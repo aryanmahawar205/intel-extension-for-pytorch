@@ -127,7 +127,7 @@ def main(args_in: Optional[List[str]] = None) -> None:
     )
     parser.add_argument(
         "--weight-dtype",
-        choices=["INT8", "INT4"],
+        choices=["INT8", "INT4", "NF4"],
         default="INT8",
         type=str,
         help="weight data type for weight only quantization. Unrelated to activation"
@@ -199,7 +199,7 @@ def main(args_in: Optional[List[str]] = None) -> None:
     group_size = args.group_size
     if group_size == 0:
         # weight dtype is ignored if gptq is true
-        if args.weight_dtype == "INT4":
+        if args.weight_dtype in ("INT4", "NF4"):
             group_size = 128
         else:
             group_size = -1
@@ -208,6 +208,8 @@ def main(args_in: Optional[List[str]] = None) -> None:
         (group_size & (group_size-1) == 0)
     ), f"Invalid group size for WOQ: {group_size}"
 
+    if re.search("llava", str(args.model_name_or_path), re.IGNORECASE) and args.prompt is None:
+        args.prompt = "What is this image?"
     if not args.autotp:
         if not args.ipex_weight_only_quantization and not args.ipex_smooth_quant:
             path = Path(parent_path, "single_instance/run_generation.py")
@@ -258,10 +260,6 @@ def main(args_in: Optional[List[str]] = None) -> None:
             infer_cmd.extend(["--num-warmup", str(args.num_warmup)])
             infer_cmd.extend(["--batch-size", str(args.batch_size)])
             infer_cmd.extend(["--output-dir", str(args.output_dir)])
-            if args.quant_with_amp:
-                infer_cmd.extend(["--quant-with-amp"])
-            if args.greedy:
-                infer_cmd.extend(["--greedy"])
             if args.ipex_weight_only_quantization:
                 infer_cmd.extend(["--ipex-weight-only-quantization"])
                 infer_cmd.extend(["--weight-dtype", str(args.weight_dtype)])
@@ -497,6 +495,7 @@ def main(args_in: Optional[List[str]] = None) -> None:
                 "dolly": ("/dolly_local_shard"),
                 "qwen": ("/qwen_local_shard"),
                 "git": ("/git_local_shard"),
+                "llava": ("/llava_local_shard"),
             }
             model_type = next(
                 (x for x in MODEL_CLASSES.keys() if x in args.model_name_or_path.lower()), "auto"

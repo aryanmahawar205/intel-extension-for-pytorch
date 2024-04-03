@@ -1,6 +1,6 @@
 import torch
 import copy
-import warnings
+from ..utils._logger import logger, WarningType
 import pkg_resources
 from intel_extension_for_pytorch.cpu._auto_kernel_selection import (
     _enable_tpp,
@@ -11,6 +11,13 @@ import intel_extension_for_pytorch as ipex
 from ..utils.weight_only_quantization import (
     _is_woq_qconfig,
     _convert_woq_with_low_precision_checkpoint,
+)
+
+from .tensor_parallel import (
+    shard_lm_head_weights,
+    shard_mha_weights,
+    shard_mlp_weights,
+    update_heads_info,
 )
 
 
@@ -80,6 +87,34 @@ def _set_optimized_model_for_generation(
     return model
 
 
+def check_transformers_for_llm_support():
+    installed_pkg = {pkg.key for pkg in pkg_resources.working_set}
+    min_version = "4.28.1"
+    validated_version = "4.38.2"
+    if "transformers" not in installed_pkg:
+        raise RuntimeError(
+            "ipex.llm.optimize requires transformers package with version at least {} , fallback".format(
+                min_version
+            )
+        )
+
+    import transformers
+    from packaging import version
+
+    trans_version = transformers.__version__
+    if version.parse(trans_version) < version.parse(min_version):
+        raise RuntimeError(
+            "ipex.llm.optimize requires transformers: at least {} while but your transformers== {}, fallback".format(
+                min_version, trans_version
+            )
+        )
+    if version.parse(trans_version) > version.parse(validated_version):
+        logger.warning(
+            f"The transformers version is {trans_version}, bigger than validated {validated_version}, may have risks",
+            _type=WarningType.MissingDependency,
+        )
+
+
 def model_convert_reference(_model):
     import transformers
     from packaging import version
@@ -92,6 +127,7 @@ def model_convert_reference(_model):
         _beam_search,
         _greedy_search,
         _sample,
+        _beam_sample,
     )
 
     # model wise optimization for MHA module
@@ -123,7 +159,6 @@ def model_convert_reference(_model):
         FalconForCausalLM_forward,
         CodeGenForCausalLM_forward,
         BaichuanForCausalLM_forward,
-        BaichuanModel_forward,
         ChatGLMModel_forward,
         GLMTransformer_forward,
         ChatGLMForConditionalGeneration_forward,
@@ -145,9 +180,12 @@ def model_convert_reference(_model):
         GitEncoder_forward,
         GitVisionEncoder_forward,
         GitModel_forward,
+        CLIPEncoder_forward,
+        LlavaLlamaForCausalLM_forward,
         prepare_inputs_for_generation,
         prepare_inputs_for_generation_gptbigcode,
         prepare_inputs_for_generation_llama,
+        prepare_inputs_labels_for_multimodal_llavallama,
     )
 
     if not hasattr(_model.config, "architectures"):
@@ -160,6 +198,7 @@ def model_convert_reference(_model):
     convert_function(_model, "beam_search", _beam_search)
     convert_function(_model, "greedy_search", _greedy_search)
     convert_function(_model, "sample", _sample)
+    convert_function(_model, "beam_sample", _beam_sample)
     convert_function(
         _model,
         "_extract_past_from_model_output",
@@ -298,6 +337,19 @@ def model_convert_reference(_model):
     except ImportError:
         # distributed uses default False
         pass
+    need_ipex_tp = False
+    if _model.device.type == "cpu":
+        from ..cpu import comm as ipex_comm
+
+        world_size = ipex_comm.get_world_size()
+        rank = ipex_comm.get_rank()
+        if world_size > 1:
+            global distributed
+            if distributed:
+                need_ipex_tp = False
+            else:
+                need_ipex_tp = True
+                distributed = True
 
     # model-wise optimizations - MHA module
     for supported_mha_class in [
@@ -310,6 +362,26 @@ def model_convert_reference(_model):
         transformers.models.gpt_bigcode.modeling_gpt_bigcode.GPTBigCodeAttention,
         transformers.models.t5.modeling_t5.T5Attention,
     ]:
+        if need_ipex_tp and supported_mha_class in [
+            transformers.models.llama.modeling_llama.LlamaAttention,
+            transformers.models.gptj.modeling_gptj.GPTJAttention,
+        ]:
+            num_heads = _model.config.num_attention_heads
+            num_kv_heads = num_heads
+            for name in ["num_key_value_heads"]:
+                if hasattr(_model.config, name):
+                    num_kv_heads = getattr(_model.config, name)
+            head_dim = _model.config.hidden_size // num_heads
+            shard_mha_weights(
+                _model,
+                supported_mha_class,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                rank,
+                world_size,
+            )
+
         convert_class(
             _model,
             supported_mha_class,
@@ -317,6 +389,36 @@ def model_convert_reference(_model):
             _model.config,
             distributed=distributed,
         )
+    if need_ipex_tp:
+        for supported_mlp_class in [
+            transformers.models.llama.modeling_llama.LlamaMLP,
+            transformers.models.gptj.modeling_gptj.GPTJMLP,
+        ]:
+            shard_mlp_weights(
+                _model,
+                supported_mlp_class,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                rank,
+                world_size,
+            )
+        for supported_model_class in [
+            transformers.models.llama.modeling_llama.LlamaForCausalLM,
+            transformers.models.gptj.modeling_gptj.GPTJForCausalLM,
+        ]:
+            if isinstance(_model, supported_model_class):
+                shard_lm_head_weights(
+                    _model,
+                    supported_model_class,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    rank,
+                    world_size,
+                )
+                update_heads_info(_model, rank, world_size)
+
     # model-wise optimizations - Feedforward/Decoder layer modules
     for supported_decoder_class in [
         transformers.models.llama.modeling_llama.LlamaDecoderLayer,
@@ -405,12 +507,16 @@ def model_convert_reference(_model):
             _model.config,
             distributed=distributed,
         )
-        if not distributed:
-            convert_function(_model.model, "forward", BaichuanModel_forward)
-            _model.model.future_mask = _gen_baichuan_alibi_mask(
-                _model.model.layers[0].self_attn.num_heads,
-                _model.model.layers[0].self_attn.max_position_embeddings,
+        if hasattr(_model.model, "first_run"):  # baichuan 13b
+            _model.model.register_buffer(
+                "future_mask",
+                _gen_baichuan_alibi_mask(
+                    _model.model.n_head,
+                    _model.model.max_cache_pos,
+                ).to(_model.config.torch_dtype),
+                persistent=False,
             )
+            _model.model.first_run = False
     elif _model.config.architectures[0] == "ChatGLMModel":
         convert_function(_model, "forward", ChatGLMForConditionalGeneration_forward)
         convert_function(_model.transformer, "forward", ChatGLMModel_forward)
@@ -559,6 +665,55 @@ def model_convert_reference(_model):
             _model.config,
             distributed=distributed,
         )
+    elif _model.config.architectures[0] == "LlavaLlamaForCausalLM":
+        convert_function(_model, "forward", LlavaLlamaForCausalLM_forward)
+        convert_function(
+            _model,
+            "prepare_inputs_labels_for_multimodal",
+            prepare_inputs_labels_for_multimodal_llavallama,
+        )
+        convert_function(
+            _model.model,
+            "forward",
+            LlamaModel_forward,
+        )
+        convert_class(
+            _model,
+            type(_model.model.layers[0].self_attn),
+            _IPEXAttentionRef,
+            _model.config,
+            distributed=distributed,
+        )
+        convert_class(
+            _model,
+            type(_model.model.layers[0]),
+            _IPEXDecoderLayerRef,
+            _model.config,
+            distributed=distributed,
+        )
+        convert_function(
+            _model.model.vision_tower.vision_tower.vision_model.encoder,
+            "forward",
+            CLIPEncoder_forward,
+        )
+        convert_class(
+            _model,
+            type(_model.model.vision_tower.vision_tower.vision_model.encoder.layers[0]),
+            _IPEXDecoderLayerRef,
+            _model.config,
+            distributed=distributed,
+        )
+        convert_class(
+            _model,
+            type(
+                _model.model.vision_tower.vision_tower.vision_model.encoder.layers[
+                    0
+                ].self_attn
+            ),
+            _IPEXAttentionRef,
+            _model.config,
+            distributed=distributed,
+        )
 
     return _model
 
@@ -582,64 +737,65 @@ def get_dummy_input(_model, return_dict=False):
     past_key_values = tuple(
         [
             (
-                torch.zeros(1, 0, 0, 1, dtype=torch.long).contiguous(),
-                torch.zeros([1, 1, 1, 1]).contiguous(),
-                torch.zeros([1, 1, 1, 1]).contiguous(),
-                torch.zeros(1, 4, dtype=torch.long),
-            )
-            if _model.config.architectures[0] != "T5ForConditionalGeneration"
-            else (
-                torch.zeros(1, 0, 0, 1, dtype=torch.long).contiguous(),
-                torch.zeros([1, 1, 1, 1]).contiguous(),
-                torch.zeros([1, 1, 1, 1]).contiguous(),
-                torch.zeros(1, 4, dtype=torch.long),
-                torch.zeros(1, 0, 0, 1, dtype=torch.long).contiguous(),
-                torch.zeros(
-                    [
-                        32,
-                        1,
-                        _model.decoder.block[i].layer[1].EncDecAttention.n_heads,
-                        _model.decoder.block[i]
-                        .layer[1]
-                        .EncDecAttention.key_value_proj_dim,
-                    ]
-                ).contiguous(),
-                torch.zeros(
-                    [
-                        32,
-                        1,
-                        _model.decoder.block[i].layer[1].EncDecAttention.n_heads,
-                        _model.decoder.block[i]
-                        .layer[1]
-                        .EncDecAttention.key_value_proj_dim,
-                    ]
-                ).contiguous(),
-                torch.zeros(1, 4, dtype=torch.long),
+                (
+                    torch.zeros(1, 0, 0, 1, dtype=torch.long).contiguous(),
+                    torch.zeros([1, 1, 1, 1]).contiguous(),
+                    torch.zeros([1, 1, 1, 1]).contiguous(),
+                    torch.zeros(1, 4, dtype=torch.long),
+                )
+                if _model.config.architectures[0] != "T5ForConditionalGeneration"
+                else (
+                    torch.zeros(1, 0, 0, 1, dtype=torch.long).contiguous(),
+                    torch.zeros([1, 1, 1, 1]).contiguous(),
+                    torch.zeros([1, 1, 1, 1]).contiguous(),
+                    torch.zeros(1, 4, dtype=torch.long),
+                    torch.zeros(1, 0, 0, 1, dtype=torch.long).contiguous(),
+                    torch.zeros(
+                        [
+                            32,
+                            1,
+                            _model.decoder.block[i].layer[1].EncDecAttention.n_heads,
+                            _model.decoder.block[i]
+                            .layer[1]
+                            .EncDecAttention.key_value_proj_dim,
+                        ]
+                    ).contiguous(),
+                    torch.zeros(
+                        [
+                            32,
+                            1,
+                            _model.decoder.block[i].layer[1].EncDecAttention.n_heads,
+                            _model.decoder.block[i]
+                            .layer[1]
+                            .EncDecAttention.key_value_proj_dim,
+                        ]
+                    ).contiguous(),
+                    torch.zeros(1, 4, dtype=torch.long),
+                )
             )
             for i in range(model_num_layers)
         ]
     )
 
-    input_ids = torch.ones(32).to(torch.long)
-    model_inputs = _model.prepare_inputs_for_generation(input_ids.unsqueeze(0))
-    has_position_ids = "position_ids" in model_inputs
-    attention_mask = torch.ones(len(input_ids))
-    position_ids = torch.arange(len(input_ids))
+    input_ids = torch.ones(32).to(torch.long).unsqueeze(0)
+    attention_mask = torch.ones_like(input_ids)
+    # prepare_inputs_for_generation is just for checking if position_ids should be in the model inputs,
+    # input input_ids and attention_mask to make sure this func can generate the correct position_ids.
+    model_inputs = _model.prepare_inputs_for_generation(
+        input_ids, attention_mask=attention_mask
+    )
+    has_position_ids = model_inputs.get("position_ids", None) is not None
+    position_ids = torch.arange(input_ids.shape[-1]).unsqueeze(0)
     if has_position_ids:
         sample_inputs = (
             {
-                "input_ids": input_ids.unsqueeze(0),
-                "attention_mask": attention_mask.unsqueeze(0),
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
                 "past_key_values": past_key_values,
-                "position_ids": position_ids.unsqueeze(0),
+                "position_ids": position_ids,
             }
             if return_dict
-            else (
-                input_ids.unsqueeze(0),
-                attention_mask.unsqueeze(0),
-                past_key_values,
-                position_ids.unsqueeze(0),
-            )
+            else (input_ids, attention_mask, past_key_values, position_ids)
         )
     elif _model.config.architectures[0] == "T5ForConditionalGeneration":
         last_hidden_state = torch.rand([1, 32, 2048])
@@ -647,7 +803,7 @@ def get_dummy_input(_model, return_dict=False):
             (
                 {
                     "decoder_input_ids": torch.ones(1).to(torch.long).unsqueeze(0),
-                    "attention_mask": attention_mask.unsqueeze(0),
+                    "attention_mask": attention_mask,
                     "past_key_values": past_key_values,
                     "encoder_outputs": (last_hidden_state,),
                 }
@@ -655,7 +811,7 @@ def get_dummy_input(_model, return_dict=False):
             if return_dict
             else (
                 torch.ones(1).to(torch.long).unsqueeze(0),
-                attention_mask.unsqueeze(0),
+                attention_mask,
                 past_key_values,
                 (last_hidden_state,),
             )
@@ -663,12 +819,12 @@ def get_dummy_input(_model, return_dict=False):
     else:
         sample_inputs = (
             {
-                "input_ids": input_ids.unsqueeze(0),
-                "attention_mask": attention_mask.unsqueeze(0),
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
                 "past_key_values": past_key_values,
             }
             if return_dict
-            else (input_ids.unsqueeze(0), attention_mask.unsqueeze(0), past_key_values)
+            else (input_ids, attention_mask, past_key_values)
         )
     if _model.config.architectures[0] == "GitForCausalLM":
         batch_size = (
@@ -700,11 +856,24 @@ def get_dummy_input(_model, return_dict=False):
             sample_inputs["past_key_values"] = past_key_values
         else:
             sample_inputs = (
-                input_ids.unsqueeze(0).repeat(_model.config.batch_size, 1),
-                attention_mask.unsqueeze(0).repeat(_model.config.batch_size, 1),
+                input_ids.repeat(_model.config.batch_size, 1),
+                attention_mask.repeat(_model.config.batch_size, 1),
                 past_key_values,
                 torch.zeros(_model.config.batch_size, 3, 224, 224),
             )
+    if _model.config.architectures[0] == "LlavaLlamaForCausalLM":
+        batch_size = (
+            _model.config.batch_size if hasattr(_model.config, "batch_size") else 1
+        )
+        if return_dict:
+            sample_inputs.pop("input_ids", None)
+            sample_inputs["inputs_embeds"] = torch.zeros(batch_size, 1, 4096).to(
+                _model.dtype
+            )
+        else:
+            sample_inputs = (
+                torch.zeros(batch_size, 1, 4096).to(_model.dtype),
+            ) + sample_inputs[1:]
 
     if "return_last_logit" in model_inputs:
         if return_dict:
@@ -756,14 +925,31 @@ def model_convert_lowering(
 
     if device == "cpu":
         from .models.cpu.modules.attentions import _IPEXAttentionCPU
-        from .models.cpu.fusions.mha_fusion import _IPEXRMSNorm
+        from .models.cpu.fusions.mha_fusion import _IPEXRMSNormCPU
         from .models.cpu.modules.decoder import _IPEXDecoderLayerCPU
 
         _disable_tpp()
         if not is_quantization:
             if dtype is torch.bfloat16:
                 _enable_tpp()
-            _model = ipex.optimize(_model.eval(), dtype=dtype, inplace=True)
+            if ipex._C.is_llga_fp32_bf16_enabled():
+                _disable_tpp()
+                _model = ipex.optimize(
+                    _model.eval(),
+                    dtype=dtype,
+                    inplace=True,
+                    weights_prepack=False,
+                )
+            else:
+                if dtype is torch.float32:
+                    _model = ipex.optimize(
+                        _model.eval(),
+                        dtype=dtype,
+                        inplace=True,
+                        auto_kernel_selection=True,
+                    )
+                else:
+                    _model = ipex.optimize(_model.eval(), dtype=dtype, inplace=True)
 
         if not is_quantization or woq:
             import transformers
@@ -794,7 +980,7 @@ def model_convert_lowering(
                 lowering_class_cpu(
                     _model,
                     supported_class,
-                    _IPEXRMSNorm,
+                    _IPEXRMSNormCPU,
                     _model.config,
                     tpp=False,
                     woq=False,
@@ -883,9 +1069,14 @@ def optimize(
     r"""
     Apply optimizations at Python frontend to the given transformers model (nn.Module).
     This API focus on transformers models, especially for generation tasks inference.
-    Well supported model family:
+
+    Well supported model family with full functionalities:
     Llama, GPT-J, GPT-Neox, OPT, Falcon, Bloom, CodeGen, Baichuan, ChatGLM, GPTBigCode,
-    T5, Mistral, MPT, Mixtral, StableLM, QWen, Git.
+    T5, Mistral, MPT, Mixtral, StableLM, QWen, Git, Llava.
+
+    For the model that is not in the scope of supported model family above, will try to
+    apply default ipex.optimize transparently to get benifits (not include quantizations,
+    only works for dtypes of torch.bfloat16 and torch.float).
 
     Args:
         model (torch.nn.Module): User model to apply optimizations.
@@ -937,70 +1128,51 @@ def optimize(
     if isinstance(model, torch.jit.ScriptModule):
         return model
     if model.training or optimizer is not None:
-        warnings.warn(
-            "fail to apply ipex.llm.optimize, this API supports inference for now, fallback to default path"
+        logger.warning(
+            "fail to apply ipex.llm.optimize, this API supports inference for now, fallback to default path",
+            _type=WarningType.NotSupported,
         )
         return model, optimizer
 
     validate_device_avaliable(device)
 
     try:
-        installed_pkg = {pkg.key for pkg in pkg_resources.working_set}
-        min_version = "4.28.1"
-        validated_version = "4.38.1"
-        if "transformers" not in installed_pkg:
-            raise RuntimeError(
-                "ipex.llm.optimize requires transformers package with version at least {} , fallback".format(
-                    min_version
+        well_supported_model = False
+        if hasattr(model, "config") and hasattr(model.config, "architectures"):
+            well_supported_model = model.config.architectures[0] in [
+                "GPTJForCausalLM",
+                "LlamaForCausalLM",
+                "GPTNeoXForCausalLM",
+                "OPTForCausalLM",
+                "FalconForCausalLM",
+                "RWForCausalLM",
+                "BloomForCausalLM",
+                "CodeGenForCausalLM",
+                "BaichuanForCausalLM",
+                "ChatGLMModel",
+                "GPTBigCodeForCausalLM",
+                "T5ForConditionalGeneration",
+                "MistralForCausalLM",
+                "MixtralForCausalLM",
+                "MptForCausalLM",
+                "StableLmForCausalLM",
+                "QWenLMHeadModel",
+                "GitForCausalLM",
+                "LlavaLlamaForCausalLM",
+            ]
+
+        if well_supported_model:
+            check_transformers_for_llm_support()
+        else:
+            if quantization_config is not None:
+                logger.warning(
+                    "ipex.llm.optimize supports quantizations on Llama, GPT-J, GPT-Neox, Falcon, OPT, Bloom, CodeGen,"
+                    + " Baichuan, ChatGLM, GPTBigCode, T5, Mistral, Mixtral, MPT, StableLM, QWen, Git, and Llava,"
+                    + "fallback to origin model"
                 )
-            )
-
-        import transformers
-        from packaging import version
-
-        trans_version = transformers.__version__
-        if version.parse(trans_version) < version.parse(min_version):
-            raise RuntimeError(
-                "ipex.llm.optimize requires transformers: at least {} while but your transformers== {}, fallback".format(
-                    min_version, trans_version
-                )
-            )
-        if version.parse(trans_version) > version.parse(validated_version):
-            warnings.warn(
-                f"The transformers version is {trans_version}, bigger than validated {validated_version}, may have risks"
-            )
-        if not hasattr(model, "config"):
-            warnings.warn(
-                "Can not check transformers model config to detect its model family, fallback to origin model"
-            )
-            return model
-
-        well_supported_model = model.config.architectures[0] in [
-            "GPTJForCausalLM",
-            "LlamaForCausalLM",
-            "GPTNeoXForCausalLM",
-            "OPTForCausalLM",
-            "FalconForCausalLM",
-            "RWForCausalLM",
-            "BloomForCausalLM",
-            "CodeGenForCausalLM",
-            "BaichuanForCausalLM",
-            "ChatGLMModel",
-            "GPTBigCodeForCausalLM",
-            "T5ForConditionalGeneration",
-            "MistralForCausalLM",
-            "MixtralForCausalLM",
-            "MptForCausalLM",
-            "StableLmForCausalLM",
-            "QWenLMHeadModel",
-            "GitForCausalLM",
-        ]
-        if not well_supported_model:
-            warnings.warn(
-                "ipex.llm.optimize supports Llama, GPT-J, GPT-Neox, Falcon, OPT, Bloom, CodeGen, Baichuan, ChatGLM, "
-                + "GPTBigCode, T5, Mistral, Mixtral, MPT, StableLM, QWen, and Git, fallback to origin model"
-            )
-            return model
+                return model
+            _model = ipex.optimize(model.eval(), dtype=dtype, inplace=inplace)
+            return _model
 
         if not inplace:
             _model = copy.deepcopy(model)
@@ -1122,8 +1294,9 @@ def optimize(
         return _model
 
     except RuntimeError as e:
-        warnings.warn(
-            f"fail to apply ipex.llm.optimize due to: {e}, fallback to the origin model"
+        logger.warning(
+            f"fail to apply ipex.llm.optimize due to: {e}, fallback to the origin model",
+            _type=WarningType.NotSupported,
         )
         return model
 
@@ -1142,8 +1315,9 @@ def optimize_transformers(
     sample_inputs=None,
     deployment_mode=True,
 ):
-    warnings.warn(
-        "ipex.optimize_transformers API is going to be deprecated, please use ipex.llm.optimize instead."
+    logger.warning(
+        "ipex.optimize_transformers API is going to be deprecated, please use ipex.llm.optimize instead.",
+        _type=WarningType.DeprecatedArgument,
     )
     return optimize(
         model=model,

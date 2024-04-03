@@ -13,7 +13,11 @@ if(WIN32)
   set(USE_LIBXSMM ON)
 endif()
 
-cmake_dependent_option(BUILD_STATIC_ONEMKL "Static link with oneMKL" OFF "BUILD_WITH_XPU" ON)
+if(WIN32)
+  set(USE_SHM OFF)
+  set(USE_CCL OFF)
+endif()
+
 
 function (print_cpu_config_summary)
   # Fetch configurations of intel-ext-pt-cpu
@@ -49,6 +53,8 @@ function (print_cpu_config_summary)
     message(STATUS "  IPEX_DISP_OP          : ${IPEX_DISP_OP}")
     message(STATUS "  BUILD_XSMM_VIA_CMAKE  : ${BUILD_LIBXSMM_VIA_CMAKE}")
     message(STATUS "  USE_LIBXSMM           : ${USE_LIBXSMM}")
+    message(STATUS "  USE_CCL               : ${USE_CCL}")
+    message(STATUS "  USE_SHM               : ${USE_SHM}")
     message(STATUS "")
     message(STATUS "********************************")
 endfunction()

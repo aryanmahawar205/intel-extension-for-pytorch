@@ -8,8 +8,6 @@ from argparse import ArgumentParser
 from pathlib import Path
 import torch
 import re
-from PIL import Image
-import requests
 import deepspeed
 from deepspeed.accelerator import get_accelerator
 import deepspeed.comm as dist
@@ -28,6 +26,11 @@ from transformers import (
 import sys
 
 sys.path.append(sys.path[0] + '/../../')
+
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 # supported models now
 MODEL_CLASSES = {
@@ -53,6 +56,16 @@ MODEL_CLASSES = {
     "git": (AutoModelForCausalLM, AutoProcessor),
     "auto": (AutoModelForCausalLM, AutoTokenizer),
 }
+
+try:
+    from llava.model.language_model.llava_llama import LlavaLlamaForCausalLM
+    from llava.model.builder import load_pretrained_model
+    from llava.conversation import conv_templates
+    from llava.mm_utils import get_model_name_from_path, tokenizer_image_token
+    from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+    MODEL_CLASSES["llava"] = (LlavaLlamaForCausalLM, AutoTokenizer)
+except ImportError:
+    pass
 
 # the Deepspeed team made these so it's super fast to load (~1 minute), rather than wait 10-20min loading time.
 tp_presharded_models = [
@@ -302,11 +315,13 @@ if not hasattr(config, "text_max_length") and args.prompt is None:
     config.text_max_length = int(args.input_tokens) + int(args.max_new_tokens)
 if model_type == "mpt" and args.prompt is None:
     config.max_seq_len = int(args.input_tokens) + int(args.max_new_tokens)
+if model_type == "llava":
+    config.use_cache=True
 
 if not hasattr(config, "lm_head_generation"):
     config.lm_head_generation = True
 num_beams = 1 if args.greedy else 4
-if model_type == "git":
+if model_type in ["git", "llava"]:
     config.batch_size = int(args.batch_size) * num_beams
 # XXX: can't automatically derive dtype via config's `from_pretrained`
 # dtype = torch.bfloat16 if model_name in ["bigscience/bloom", "bigscience/bigscience-small-testing"] else torch.float16
@@ -324,7 +339,7 @@ if args.benchmark:
 
 # For now, Falcon, baichuan, baichuan2, and gptbigcode have accuracy issue with from_config with deepspeed meta device load.
 # TODO: we will change the scope once deepspeed providing the support
-if world_size == 1 or model_type in ["falcon", "baichuan", "baichuan2", "gptbigcode", "git"]:
+if world_size == 1 or model_type in ["falcon", "baichuan", "baichuan2", "gptbigcode", "git", "qwen"]:
     model = model_class[0].from_pretrained(
         model_name,
         config=config,
@@ -332,6 +347,9 @@ if world_size == 1 or model_type in ["falcon", "baichuan", "baichuan2", "gptbigc
         torch_dtype=load_dtype,
         trust_remote_code=True,
     )
+elif model_type in ["llava"]:
+    tokenizer, model, image_processor, context_len = load_pretrained_model(args.model_id)
+    model.config = config
 else: # Construct model with fake meta tensors, later will be replaced during ds-inference ckpt load
     with deepspeed.OnDevice(dtype=load_dtype, device="meta"):
         if  model_type in ["t5"]:
@@ -408,7 +426,10 @@ if args.benchmark:
 if use_ipex:
     ipex_woq_enabled = args.ipex_weight_only_quantization
     if ipex_woq_enabled:
-        weight_dtype = torch.quint4x2 if args.weight_dtype == "INT4" else torch.qint8
+        from intel_extension_for_pytorch.quantization import WoqWeightDtype
+        weight_dtype = (
+            WoqWeightDtype.INT4 if args.weight_dtype == "INT4" else WoqWeightDtype.INT8
+        )
         if args.lowp_mode == "INT8":
             lowp_mode = ipex.quantization.WoqLowpMode.INT8
         elif args.lowp_mode == "FP32":
@@ -418,7 +439,7 @@ if use_ipex:
         elif args.lowp_mode == "BF16":
             lowp_mode = ipex.quantization.WoqLowpMode.BF16
         else:  # AUTO
-            if weight_dtype == torch.quint4x2:
+            if weight_dtype == WoqWeightDtype.INT4:
                 lowp_mode = ipex.quantization.WoqLowpMode.INT8
             else:
                 lowp_mode = ipex.quantization.WoqLowpMode.BF16
@@ -453,6 +474,10 @@ else:
     streamer = None
 generate_kwargs = dict(do_sample=False, num_beams=num_beams, max_new_tokens=args.max_new_tokens, min_new_tokens=args.max_new_tokens, streamer=streamer)
 
+
+if args.token_latency and not args.ipex:
+    args.token_latency = False
+    logger.warning("--token-latency requires --ipex. Disabling --token-latency.")
 if args.token_latency:
     if not hasattr(model.config, "token_latency"):
         model.config.token_latency = True
@@ -463,9 +488,48 @@ if re.search("t5", model.config.architectures[0], re.IGNORECASE):
 print_rank0(f"Generate args {generate_kwargs}")
 
 if model_type == "git":
+    from PIL import Image
+    import requests
     prompt = Image.open(requests.get(args.image_url, stream=True).raw)
     inputs = [prompt] * args.batch_size
     generate_kwargs.pop("min_new_tokens", None)
+elif model_type == "llava":
+    from PIL import Image
+    import requests
+    from io import BytesIO
+    def load_image(image_file):
+        if image_file.startswith('http://') or image_file.startswith('https://'):
+            response = requests.get(image_file)
+            image = Image.open(BytesIO(response.content)).convert('RGB')
+        else:
+            image = Image.open(image_file).convert('RGB')
+        return image
+    model_name = get_model_name_from_path(args.model_id)
+    if 'llama-2' in model_name.lower():
+        conv_mode = "llava_llama_2"
+    elif "v1" in model_name.lower():
+        conv_mode = "llava_v1"
+    elif "mpt" in model_name.lower():
+        conv_mode = "mpt"
+    else:
+        conv_mode = "llava_v0"
+    conv = conv_templates[conv_mode].copy()
+    if "mpt" in model_name.lower():
+        roles = ('user', 'assistant')
+    else:
+        roles = conv.roles
+    if args.prompt is not None:
+        prompt = args.prompt
+    image = load_image(args.image_url)
+    image = [image] * args.batch_size
+    if model.config.mm_use_im_start_end:
+        prompt = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + prompt
+    else:
+        prompt = DEFAULT_IMAGE_TOKEN + '\n' + prompt
+    conv.append_message(conv.roles[0], prompt)
+    conv.append_message(conv.roles[1], None)
+    prompt = conv.get_prompt()
+    prompt = [prompt] * args.batch_size
 else:
     # input tokens
     input_sentences = []
@@ -508,6 +572,10 @@ def generate():
     if model_type == "git":
         input_tokens = tokenizer(images=inputs, return_tensors="pt")
         input_ids = input_tokens.pixel_values
+    elif model_type == "llava":
+        input_ids = torch.stack([tokenizer_image_token(pmt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt') for pmt in prompt])
+        image_tensor = [image_processor.preprocess(img, return_tensors='pt')['pixel_values'].to(infer_dtype) for img in image]
+        input_tokens = {"input_ids": input_ids, "images": image_tensor}
     else:
         input_tokens = tokenizer.batch_encode_plus(inputs, return_tensors="pt")
         input_ids = input_tokens.input_ids
@@ -527,7 +595,7 @@ def generate():
         o - i if model.config.model_type != "t5" else o
         for i, o in zip(input_tokens_lengths, output_tokens_lengths)
     ]
-    gen_text = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+    gen_text = tokenizer.batch_decode(gen_ids[:, input_ids.shape[1]:] if model_type=="llava" else gen_ids, skip_special_tokens=True)
 
     return zip(inputs, gen_text, total_new_tokens), outputs
 

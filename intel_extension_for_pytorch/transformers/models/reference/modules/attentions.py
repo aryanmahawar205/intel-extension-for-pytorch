@@ -10,6 +10,7 @@ from ..fusions.linear_fusion import (
     _IPEXConcatLinearRef,
 )
 from torch.nn import functional as F
+from intel_extension_for_pytorch.nn.modules import WeightOnlyQuantizedLinear
 
 
 def _GPTJAttention_forward(
@@ -402,32 +403,46 @@ def _FalconAttention_forward(
     num_kv_heads = (
         self.num_heads if self.new_decoder_architecture else self.num_kv_heads
     )
-
-    (query_layer, key_layer, value_layer) = self._split_heads(fused_qkv)
-    batch_size, query_length, _, _ = query_layer.shape
+    if self.new_decoder_architecture or not self.rotary:
+        (query_layer, key_layer, value_layer) = self._split_heads(fused_qkv)
+        batch_size, query_length, _, _ = query_layer.shape
+    else:
+        batch_size, query_length, _ = fused_qkv.shape
 
     past_kv_length = 0 if layer_past is None else layer_past[0].shape[1]
 
     if self.rotary:
         seq_len = query_length + past_kv_length
-        key_layer = self._IPEXROPE(
-            key_layer,
-            torch.tensor(past_kv_length),
-            num_kv_heads,
-            self.head_dim,
-            self.head_dim // 2,
-            self.head_dim,
-            seq_len,
-        )
-        query_layer = self._IPEXROPE(
-            query_layer,
-            torch.tensor(past_kv_length),
-            self.num_heads,
-            self.head_dim,
-            self.head_dim // 2,
-            self.head_dim,
-            seq_len,
-        )
+        if self.new_decoder_architecture:
+            key_layer = self._IPEXROPE(
+                key_layer,
+                torch.tensor(past_kv_length),
+                num_kv_heads,
+                self.head_dim,
+                self.head_dim // 2,
+                self.head_dim,
+                seq_len,
+            )
+            query_layer = self._IPEXROPE(
+                query_layer,
+                torch.tensor(past_kv_length),
+                self.num_heads,
+                self.head_dim,
+                self.head_dim // 2,
+                self.head_dim,
+                seq_len,
+            )
+        else:
+            query_layer, key_layer, value_layer = self._IPEXROPE(
+                fused_qkv,
+                torch.tensor(past_kv_length),
+                self.num_heads,
+                self.head_dim,
+                self.head_dim // 2,
+                self.head_dim,
+                seq_len,
+                3,
+            )
     attention_mask_float = (
         (attention_mask * 1.0)
         .masked_fill(attention_mask.to(torch.bool), float("-1e9"))
@@ -1415,7 +1430,6 @@ def _StableLMEpochAttention_forward(
         query = self.q_proj(hidden_states)
         key = self.k_proj(hidden_states)
         value = self.v_proj(hidden_states)
-
     kv_seq_len = (
         q_len + past_key_value[0].size(-2) if past_key_value is not None else q_len
     )
@@ -1437,6 +1451,9 @@ def _StableLMEpochAttention_forward(
         query = query.view(bsz, q_len, self.num_heads, self.head_dim)
         key = key.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
         value = value.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        if hasattr(self, "use_qk_layernorm") and self.use_qk_layernorm:
+            query = self.q_norm(query.transpose(1, 2)).transpose(1, 2)
+            key = self.k_norm(key.transpose(1, 2)).transpose(1, 2)
         key = self._IPEXROPE(
             key,
             position_ids,
@@ -1682,6 +1699,52 @@ def _GitVisionAttention_forward(
     return attn_output, attn_weights
 
 
+def _CLIPAttention_forward(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    causal_attention_mask: Optional[torch.Tensor] = None,
+    output_attentions: Optional[bool] = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    bsz, tgt_len, embed_dim = hidden_states.size()
+    if hasattr(self, "concat_qkv"):
+        concat_qkv = self.concat_qkv(hidden_states)
+        query, key, value = concat_qkv
+        query = query.view(bsz, tgt_len, self.num_heads, self.head_dim)
+        key = key.view(bsz, tgt_len, self.num_key_value_heads, self.head_dim)
+        value = value.view(bsz, tgt_len, self.num_key_value_heads, self.head_dim)
+    else:
+        query = self.q_proj(hidden_states)
+        key = self.k_proj(hidden_states)
+        value = self.v_proj(hidden_states)
+
+    if causal_attention_mask is not None:
+        if attention_mask is not None:
+            attention_mask = attention_mask + causal_attention_mask
+
+    (attn_output, attn_weights, _) = self._IPEXScaleDotProduct(
+        query,
+        key,
+        value,
+        1 / self.scale,
+        None,
+        None,
+        attention_mask,
+        vision=True,
+    )
+
+    if not output_attentions:
+        attn_weights = None
+
+    attn_output = attn_output.view(bsz, self.num_heads, tgt_len, self.head_dim)
+    attn_output = attn_output.transpose(1, 2)
+    attn_output = attn_output.reshape(bsz, tgt_len, embed_dim)
+
+    # attn_output = self.out_proj(attn_output)
+
+    return attn_output, attn_weights
+
+
 def _create_attention_mask_for_git(
     self, tgt, memory, tgt_mask, past_key_values_length, memory_key_padding_mask=None
 ):
@@ -1781,9 +1844,15 @@ class _IPEXAttentionRef(nn.Module):
             self.num_key_value_heads = module.num_key_value_heads
         else:
             if hasattr(config, "num_key_value_heads"):
-                raise ValueError(
-                    "Your transformers version does not support GQA feature, plese upgrade (>= 4.31.0)"
-                )
+                if (
+                    self.model_backbone == "LlavaLlamaForCausalLM"
+                    and module._get_name() == "CLIPAttention"
+                ):
+                    self.num_key_value_heads = self.num_attention_heads
+                else:
+                    raise ValueError(
+                        "Your transformers version does not support GQA feature, plese upgrade (>= 4.31.0)"
+                    )
             else:
                 self.num_key_value_heads = self.num_attention_heads
         self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
@@ -1805,8 +1874,14 @@ class _IPEXAttentionRef(nn.Module):
                 "MptForCausalLM",
                 "GitForCausalLM",
             ]
-            or self.model_backbone == "BaichuanForCausalLM"
-            and hasattr(module, "rotary_emb")
+            or (
+                self.model_backbone == "BaichuanForCausalLM"
+                and hasattr(module, "rotary_emb")
+            )
+            or (
+                self.model_backbone == "LlavaLlamaForCausalLM"
+                and module._get_name() != "CLIPAttention"
+            )
         ):
             if hasattr(module, "rotary_dim"):
                 self.pos_embd_dim = module.rotary_dim
@@ -1841,12 +1916,25 @@ class _IPEXAttentionRef(nn.Module):
             "MistralForCausalLM",
             "MixtralForCausalLM",
             "StableLmForCausalLM",
+            "LlavaLlamaForCausalLM",
         ]:
             if (
                 hasattr(module, "q_proj")
                 and hasattr(module, "k_proj")
                 and hasattr(module, "v_proj")
-            ):
+                and (
+                    isinstance(module.q_proj, torch.nn.Linear)
+                    or isinstance(module.q_proj, WeightOnlyQuantizedLinear)
+                )
+                and (
+                    isinstance(module.k_proj, torch.nn.Linear)
+                    or isinstance(module.k_proj, WeightOnlyQuantizedLinear)
+                )
+                and (
+                    isinstance(module.v_proj, torch.nn.Linear)
+                    or isinstance(module.v_proj, WeightOnlyQuantizedLinear)
+                )
+            ) and not (hasattr(self, "use_qk_layernorm") and self.use_qk_layernorm):
 
                 def get_weight_shape(mod):
                     if hasattr(mod, "in_features") and hasattr(mod, "out_features"):
@@ -2219,6 +2307,24 @@ class _IPEXAttentionRef(nn.Module):
                 past_key_value,
                 output_attentions,
                 pixel_values_present,
+            )
+        elif self.model_backbone == "LlavaLlamaForCausalLM":
+            if vision is not None and vision:
+                return _CLIPAttention_forward(
+                    self,
+                    hidden_states,
+                    attention_mask,
+                    encoder_attention_mask,
+                    output_attentions,
+                )
+            return _LlamaAttention_forward(
+                self,
+                hidden_states,
+                attention_mask,
+                position_ids,
+                past_key_value,
+                output_attentions,
+                use_cache,
             )
         else:
             AssertionError(False, "Do not support the optimization of your model yet")
