@@ -1543,16 +1543,15 @@ def _QWenAttention_forward(
         3,
     )
 
-    if use_cache:
-        (attn_output, attn_weights, present) = self._IPEXScaleDotProduct(
-            query,
-            key,
-            value,
-            math.sqrt(self.head_dim) if self.scale_attn_weights else 1,
-            layer_past,
-            None,
-            attention_mask,
-        )
+    (attn_output, attn_weights, present) = self._IPEXScaleDotProduct(
+        query,
+        key,
+        value,
+        math.sqrt(self.head_dim) if self.scale_attn_weights else 1,
+        layer_past,
+        None,
+        attention_mask,
+    )
     attn_output = attn_output.transpose(1, 2)
     attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
 
@@ -1935,25 +1934,11 @@ class _IPEXAttentionRef(nn.Module):
                     or isinstance(module.v_proj, WeightOnlyQuantizedLinear)
                 )
             ) and not (hasattr(self, "use_qk_layernorm") and self.use_qk_layernorm):
-
-                def get_weight_shape(mod):
-                    if hasattr(mod, "in_features") and hasattr(mod, "out_features"):
-                        return [mod.in_features, mod.out_features]
-                    elif hasattr(mod, "weight") and hasattr(mod.weight, "shape"):
-                        return list(mod.weight.shape)
-                    return None
-
-                weight_shapes = [
-                    get_weight_shape(mod)
-                    for mod in [module.q_proj, module.k_proj, module.v_proj]
-                ]
-                if weight_shapes[0] is not None and all(
-                    weight_shapes[0] == shape for shape in weight_shapes[1:]
-                ):
-                    self.concat_qkv = _IPEXConcatLinearRef(
-                        [module.q_proj, module.k_proj, module.v_proj]
-                    )
-                    del module.q_proj, module.k_proj, module.v_proj
+                # we support MHA, GQA, MQA for concat linear
+                self.concat_qkv = _IPEXConcatLinearRef(
+                    [module.q_proj, module.k_proj, module.v_proj]
+                )
+                del module.q_proj, module.k_proj, module.v_proj
 
         self._IPEXScaleDotProduct = _IPEXScaleDotProductRef(module, config)
 
